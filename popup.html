@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChatGPT 工具调用限流</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <h1>工具调用限流</h1>
+    <p class="hint">只显示 ChatGPT 页面里最新的工具调用，旧工具调用会被隐藏。</p>
+
+    <label class="row">
+      <span>启用</span>
+      <input id="enabled" type="checkbox" />
+    </label>
+
+    <label class="field">
+      <span>最多显示最新</span>
+      <input id="limit" type="number" min="1" max="100" step="1" />
+      <span>个工具调用</span>
+    </label>
+
+    <label class="row">
+      <span>显示页面角标</span>
+      <input id="showBadge" type="checkbox" />
+    </label>
+
+    <section class="stats" aria-live="polite">
+      <div><strong id="total">-</strong><span>总工具</span></div>
+      <div><strong id="visible">-</strong><span>已显示</span></div>
+      <div><strong id="hidden">-</strong><span>已隐藏</span></div>
+    </section>
+
+    <div class="actions">
+      <button id="save" type="button">保存并应用</button>
+      <button id="toggleReveal" type="button" class="secondary">临时显示全部</button>
+    </div>
+
+    <p id="status" class="status"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
