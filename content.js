@@ -7,12 +7,14 @@
   const LOCAL_STATS_KEY = "cgToolCallLimiterStats";
   const CARD_MARK = "data-cg-tool-limiter-card";
   const HIDDEN_CLASS = "cg-tool-limiter-hidden";
+  const PREHIDDEN_CLASS = "cg-tool-limiter-prehidden";
   const BADGE_ID = "cg-tool-limiter-badge";
 
   let settings = { ...DEFAULT_SETTINGS };
   let temporaryRevealAll = false;
   let applyTimer = 0;
   let badgeEl = null;
+  let observerStarted = false;
   let lastStats = {
     total: 0,
     visible: 0,
@@ -113,10 +115,11 @@
     return uniqueNodes(document.querySelectorAll(selectors.join(",")));
   }
 
-  function collectToolCards() {
+  function collectToolCardsFrom(root) {
     const records = [];
     const seenCards = new Set();
-    for (const labelEl of collectLabelCandidates()) {
+    const labels = root === document ? collectLabelCandidates() : collectLabelCandidatesFrom(root);
+    for (const labelEl of labels) {
       const label = parseToolLabel(labelEl);
       if (!label) continue;
       const card = findToolCardFromLabel(labelEl);
@@ -125,7 +128,25 @@
       seenCards.add(card);
       records.push({ card, label });
     }
+    return records;
+  }
 
+  function collectLabelCandidatesFrom(root) {
+    const selectors = [
+      "span.font-mono",
+      "div.font-mono",
+      "[class~='font-mono']",
+      "span.truncate",
+      "button[aria-controls]"
+    ];
+    if (!(root instanceof Element)) return [];
+    const nodes = [];
+    if (root.matches(selectors.join(","))) nodes.push(root);
+    nodes.push(...root.querySelectorAll(selectors.join(",")));
+    return uniqueNodes(nodes);
+  }
+
+  function sortRecordsByDom(records) {
     // DOM 顺序最接近“最新工具调用”的实际展示顺序，避免只依赖工具编号。
     records.sort((a, b) => {
       if (a.card === b.card) return 0;
@@ -137,14 +158,52 @@
     return records;
   }
 
+  function collectToolCards() {
+    return sortRecordsByDom(collectToolCardsFrom(document));
+  }
+
   function setHidden(card, hidden) {
     card.classList.toggle(HIDDEN_CLASS, hidden);
+    card.classList.toggle(PREHIDDEN_CLASS, hidden);
     if (hidden) card.setAttribute("aria-hidden", "true");
     else card.removeAttribute("aria-hidden");
   }
 
   function clearHiddenCards() {
-    document.querySelectorAll(`[${CARD_MARK}].${HIDDEN_CLASS}`).forEach((card) => setHidden(card, false));
+    document.querySelectorAll(`[${CARD_MARK}].${HIDDEN_CLASS}, [${CARD_MARK}].${PREHIDDEN_CLASS}`).forEach((card) => setHidden(card, false));
+  }
+
+  function prehideOlderCards() {
+    if (!settings.enabled || temporaryRevealAll) return;
+    const allRecords = collectToolCards();
+    const limit = clampLimit(settings.limit);
+    if (allRecords.length <= limit) return;
+    const firstVisibleIndex = Math.max(0, allRecords.length - limit);
+    for (let index = 0; index < firstVisibleIndex; index += 1) {
+      setHidden(allRecords[index].card, true);
+    }
+    for (let index = firstVisibleIndex; index < allRecords.length; index += 1) {
+      setHidden(allRecords[index].card, false);
+    }
+  }
+
+  function prehideAddedNodes(mutations) {
+    if (!settings.enabled || temporaryRevealAll) return false;
+    const touched = [];
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        const root = node instanceof Element ? node : node.parentElement;
+        if (!(root instanceof Element)) continue;
+        const records = collectToolCardsFrom(root);
+        if (!records.length) continue;
+        touched.push(...records);
+      }
+    }
+    if (!touched.length) return false;
+    // 页面初次进入长会话时，MutationObserver 会早于完整渲染触发。
+    // 这里不等空闲回调，立即给旧工具调用打隐藏类，避免“先全部渲染再隐藏”。
+    prehideOlderCards();
+    return true;
   }
 
   function updateStats(stats) {
@@ -191,8 +250,12 @@
     const shouldLimit = settings.enabled && !temporaryRevealAll && total > limit;
     const firstVisibleIndex = shouldLimit ? Math.max(0, total - limit) : 0;
 
-    clearHiddenCards();
-    records.forEach((record, index) => setHidden(record.card, shouldLimit && index < firstVisibleIndex));
+    if (!settings.enabled || temporaryRevealAll) {
+      clearHiddenCards();
+    } else {
+      // 不再先 clearHiddenCards 再隐藏，否则每次扫描都会短暂恢复旧工具调用，造成二次渲染抖动。
+      records.forEach((record, index) => setHidden(record.card, shouldLimit && index < firstVisibleIndex));
+    }
 
     const hidden = shouldLimit ? firstVisibleIndex : 0;
     updateStats({
@@ -205,23 +268,23 @@
     });
   }
 
-  function scheduleApply(delay = 160) {
+  function scheduleApply(delay = 60) {
     window.clearTimeout(applyTimer);
-    applyTimer = window.setTimeout(() => {
-      if ("requestIdleCallback" in window) window.requestIdleCallback(applyLimit, { timeout: 700 });
-      else applyLimit();
-    }, delay);
+    applyTimer = window.setTimeout(applyLimit, delay);
   }
 
   function setupMutationObserver() {
+    if (observerStarted) return;
+    observerStarted = true;
     const observer = new MutationObserver((mutations) => {
+      const alreadyPrehidden = prehideAddedNodes(mutations);
       for (const mutation of mutations) {
         if (mutation.type === "childList" && (mutation.addedNodes.length || mutation.removedNodes.length)) {
-          scheduleApply();
+          scheduleApply(alreadyPrehidden ? 20 : 80);
           return;
         }
         if (mutation.type === "attributes" && mutation.attributeName === "aria-expanded") {
-          scheduleApply(80);
+          scheduleApply(20);
           return;
         }
       }
@@ -263,9 +326,12 @@
   }
 
   async function init() {
-    settings = await loadSettings();
+    // content script 改为 document_start：先按默认 enabled=true/limit=10 启动观察器，
+    // 再异步读取用户设置。这样进入历史会话时不会等到 document_idle 才处理大量工具调用。
     setupRuntimeMessages();
     setupMutationObserver();
+    scheduleApply(0);
+    settings = await loadSettings();
     scheduleApply(0);
   }
 

@@ -1,5 +1,6 @@
 /* ChatGPT Tool Call Limiter */
-.cg-tool-limiter-hidden {
+.cg-tool-limiter-hidden,
+.cg-tool-limiter-prehidden {
   display: none !important;
   visibility: hidden !important;
   content-visibility: hidden !important;
