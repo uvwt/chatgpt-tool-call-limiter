@@ -9,6 +9,15 @@
   const HIDDEN_CLASS = "cg-tool-limiter-hidden";
   const PREHIDDEN_CLASS = "cg-tool-limiter-prehidden";
   const BADGE_ID = "cg-tool-limiter-badge";
+  const MODAL_ID = "cg-tool-limiter-modal";
+  const NATIVE_LIST_LINK_CLASS = "cg-tool-limiter-native-list-link";
+  const OPEN_LIST_RE = /(打开工具调用列表|Open\s*tool\s*call\s*list)/i;
+  const TOOL_MESSAGE_SELECTORS = [
+    "[data-message-author-role='tool']",
+    "[data-testid*='tool-call' i]",
+    "[data-testid*='tool_call' i]",
+    "[data-testid*='tool' i]"
+  ];
 
   let settings = { ...DEFAULT_SETTINGS };
   let temporaryRevealAll = false;
@@ -74,6 +83,35 @@
     const match = text.match(TOOL_LABEL_RE);
     if (!match) return null;
     return { text, number: Number.parseInt(match[2], 10) || 0 };
+  }
+
+  function findNativeToolListLink(target) {
+    const start = target instanceof Element ? target : target?.parentElement;
+    const candidates = [];
+    let node = start;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      if (node instanceof HTMLElement && (node.matches("button, a, [role='button']") || OPEN_LIST_RE.test(normalizeText(node.textContent)))) {
+        candidates.push(node);
+      }
+    }
+    for (const candidate of candidates) {
+      const text = normalizeText(candidate.textContent || "");
+      if (OPEN_LIST_RE.test(text)) return candidate;
+    }
+    return null;
+  }
+
+  function markNativeToolListLinks(root = document) {
+    const scope = root instanceof Element || root === document ? root : document;
+    const nodes = scope.querySelectorAll?.("button, a, [role='button'], span, div") || [];
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      const text = normalizeText(node.textContent || "");
+      if (!OPEN_LIST_RE.test(text)) continue;
+      const link = findNativeToolListLink(node) || node;
+      link.classList.add(NATIVE_LIST_LINK_CLASS);
+      link.title = "已由扩展拦截：点击打开轻量工具调用列表，避免 ChatGPT 原生全量列表卡死页面";
+    }
   }
 
   function findToolCardFromLabel(labelEl) {
@@ -146,6 +184,47 @@
     return uniqueNodes(nodes);
   }
 
+  function collectToolMessageRecords(root) {
+    const scope = root instanceof Element || root === document ? root : document;
+    const nodes = [];
+    for (const selector of TOOL_MESSAGE_SELECTORS) {
+      try {
+        if (scope instanceof Element && scope.matches(selector)) nodes.push(scope);
+        nodes.push(...(scope.querySelectorAll?.(selector) || []));
+      } catch (_) {
+        // 部分浏览器对 i 修饰属性选择器兼容性不同，失败时跳过该选择器。
+      }
+    }
+    return uniqueNodes(nodes)
+      .filter((node) => node instanceof HTMLElement && !node.closest(`#${MODAL_ID}, #${BADGE_ID}`))
+      .map((card, index) => {
+        const parsed = parseToolLabel(card) || { number: index + 1, text: normalizeText(card.textContent || "工具调用") };
+        card.setAttribute(CARD_MARK, "true");
+        return { card, label: parsed };
+      });
+  }
+
+  function mergeToolRecords(...groups) {
+    const seenCards = new Set();
+    const merged = [];
+    for (const group of groups) {
+      for (const record of group) {
+        if (!(record.card instanceof HTMLElement) || seenCards.has(record.card)) continue;
+        const parentRecord = merged.find((item) => item.card.contains(record.card));
+        if (parentRecord) continue;
+        for (let index = merged.length - 1; index >= 0; index -= 1) {
+          if (record.card.contains(merged[index].card)) {
+            seenCards.delete(merged[index].card);
+            merged.splice(index, 1);
+          }
+        }
+        seenCards.add(record.card);
+        merged.push(record);
+      }
+    }
+    return merged;
+  }
+
   function sortRecordsByDom(records) {
     // DOM 顺序最接近“最新工具调用”的实际展示顺序，避免只依赖工具编号。
     records.sort((a, b) => {
@@ -159,7 +238,10 @@
   }
 
   function collectToolCards() {
-    return sortRecordsByDom(collectToolCardsFrom(document));
+    return sortRecordsByDom(mergeToolRecords(
+      collectToolCardsFrom(document),
+      collectToolMessageRecords(document)
+    ));
   }
 
   function setHidden(card, hidden) {
@@ -194,7 +276,7 @@
       for (const node of mutation.addedNodes) {
         const root = node instanceof Element ? node : node.parentElement;
         if (!(root instanceof Element)) continue;
-        const records = collectToolCardsFrom(root);
+        const records = mergeToolRecords(collectToolCardsFrom(root), collectToolMessageRecords(root));
         if (!records.length) continue;
         touched.push(...records);
       }
@@ -224,6 +306,103 @@
     });
     document.documentElement.appendChild(badgeEl);
     return badgeEl;
+  }
+
+  function buildToolListItems(records) {
+    return records.map((record, index) => ({
+      index: index + 1,
+      number: record.label.number,
+      text: record.label.text || `工具调用 ${record.label.number}`
+    }));
+  }
+
+  function showLightweightToolList() {
+    const old = document.getElementById(MODAL_ID);
+    if (old) old.remove();
+
+    const records = collectToolCards();
+    const limit = clampLimit(settings.limit);
+    const items = buildToolListItems(records.slice(Math.max(0, records.length - limit)));
+
+    const modal = document.createElement("div");
+    modal.id = MODAL_ID;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+
+    const panel = document.createElement("section");
+    panel.id = "cg-tool-limiter-modal-panel";
+
+    const head = document.createElement("header");
+    head.className = "cg-tool-limiter-modal-head";
+
+    const titleBox = document.createElement("div");
+    const title = document.createElement("h2");
+    title.className = "cg-tool-limiter-modal-title";
+    title.textContent = "轻量工具调用列表";
+    const subtitle = document.createElement("p");
+    subtitle.className = "cg-tool-limiter-modal-subtitle";
+    subtitle.textContent = `拦截 ChatGPT 原生全量列表，只显示最新 ${items.length}/${records.length} 个，避免页面无响应。`;
+    titleBox.append(title, subtitle);
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "cg-tool-limiter-modal-close";
+    close.textContent = "关闭";
+    close.addEventListener("click", () => modal.remove());
+    head.append(titleBox, close);
+
+    const list = document.createElement("div");
+    list.className = "cg-tool-limiter-list";
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "cg-tool-limiter-list-item";
+      empty.textContent = "当前页面没有识别到工具调用。";
+      list.append(empty);
+    } else {
+      for (const item of items) {
+        const row = document.createElement("div");
+        row.className = "cg-tool-limiter-list-item";
+        const idx = document.createElement("span");
+        idx.className = "cg-tool-limiter-list-index";
+        idx.textContent = `#${item.number || item.index}`;
+        const text = document.createElement("span");
+        text.className = "cg-tool-limiter-list-text";
+        text.textContent = item.text;
+        row.append(idx, text);
+        list.append(row);
+      }
+    }
+
+    panel.append(head, list);
+    modal.append(panel);
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) modal.remove();
+    });
+    document.addEventListener("keydown", function onKeydown(event) {
+      if (event.key !== "Escape") return;
+      modal.remove();
+      document.removeEventListener("keydown", onKeydown, true);
+    }, true);
+    document.documentElement.appendChild(modal);
+  }
+
+  function interceptNativeToolListClick(event) {
+    const link = findNativeToolListLink(event.target);
+    if (!link || !settings.enabled) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    showLightweightToolList();
+  }
+
+  function setupNativeListInterception() {
+    document.addEventListener("click", interceptNativeToolListClick, true);
+    document.addEventListener("auxclick", interceptNativeToolListClick, true);
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      interceptNativeToolListClick(event);
+    }, true);
+    markNativeToolListLinks(document);
   }
 
   function updateBadge() {
@@ -280,6 +459,10 @@
       const alreadyPrehidden = prehideAddedNodes(mutations);
       for (const mutation of mutations) {
         if (mutation.type === "childList" && (mutation.addedNodes.length || mutation.removedNodes.length)) {
+          for (const node of mutation.addedNodes) {
+            const root = node instanceof Element ? node : node.parentElement;
+            if (root instanceof Element) markNativeToolListLinks(root);
+          }
           scheduleApply(alreadyPrehidden ? 20 : 80);
           return;
         }
@@ -329,6 +512,7 @@
     // content script 改为 document_start：先按默认 enabled=true/limit=10 启动观察器，
     // 再异步读取用户设置。这样进入历史会话时不会等到 document_idle 才处理大量工具调用。
     setupRuntimeMessages();
+    setupNativeListInterception();
     setupMutationObserver();
     scheduleApply(0);
     settings = await loadSettings();
